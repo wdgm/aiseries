@@ -1,7 +1,9 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, JSON, String, Text, Uuid
+from decimal import Decimal
+
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, Numeric, String, Text, Uuid, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin
@@ -9,6 +11,15 @@ from app.models.base import Base, TimestampMixin
 
 class AnalysisJob(TimestampMixin, Base):
     __tablename__ = "analysis_jobs"
+    __table_args__ = (
+        # Не больше одной активной задачи анализа на книгу.
+        Index(
+            "uq_analysis_jobs_one_active_per_book",
+            "book_id",
+            unique=True,
+            postgresql_where=text("status IN ('queued','running','paused')"),
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
@@ -26,7 +37,9 @@ class AnalysisJob(TimestampMixin, Base):
     status: Mapped[str] = mapped_column(
         String(30),
         nullable=False,
-        default="pending",
+        # queued | running | paused | completed | completed_with_errors
+        # | cancelled | failed | interrupted (legacy)
+        default="queued",
         index=True,
     )
 
@@ -61,6 +74,25 @@ class AnalysisJob(TimestampMixin, Base):
     )
 
     total_tokens: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+
+    cached_input_tokens: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+
+    cost_usd: Mapped[Decimal] = mapped_column(
+        Numeric(14, 6),
+        nullable=False,
+        default=Decimal("0"),
+    )
+
+    # Запросы, для которых нет цены в provider_pricing (cost_usd неполный).
+    unpriced_requests: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
         default=0,

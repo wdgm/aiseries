@@ -35,6 +35,28 @@ services:
       - ./backend:/app
       - ./storage/books:/app/storage/books
 
+  worker:
+    build:
+      context: ./backend
+    # без container_name: можно масштабировать `docker compose up -d --scale worker=2`
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-ai_series}:${POSTGRES_PASSWORD:-change_me_locally}@db:5432/${POSTGRES_DB:-ai_series}
+    command: ["python", "-m", "app.worker"]
+    # миграции применяет backend; воркер ждёт появления таблиц сам
+    depends_on:
+      db:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    # SIGTERM -> воркер доделывает текущий фрагмент (LLM timeout 120s)
+    stop_grace_period: 150s
+    volumes:
+      - ./backend:/app
+      - ./storage/books:/app/storage/books
+
   frontend:
     build:
       context: ./frontend

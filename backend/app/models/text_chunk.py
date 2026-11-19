@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import Integer, Text, ForeignKey, UniqueConstraint
+from sqlalchemy import Integer, String, Text, ForeignKey, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -42,5 +42,10 @@ class TextChunk(Base, TimestampMixin):
     )
 
     token_count: Mapped[int | None] = mapped_column(Integer)
+
+    # Позиция фрагмента в chapter.text: content == chapter.text[char_start:char_end]
+    char_start: Mapped[int | None] = mapped_column(Integer)
+    char_end: Mapped[int | None] = mapped_column(Integer)
+    content_sha256: Mapped[str | None] = mapped_column(String(64))
 
     chapter = relationship("Chapter", back_populates="chunks")

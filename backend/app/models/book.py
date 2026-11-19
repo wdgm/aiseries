@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import String, Text, ForeignKey
+from sqlalchemy import JSON, BigInteger, Index, String, Text, ForeignKey
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -9,6 +9,9 @@ from app.models.base import Base, TimestampMixin
 
 class Book(Base, TimestampMixin):
     __tablename__ = "books"
+    __table_args__ = (
+        Index("ix_books_project_sha256", "project_id", "file_sha256"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -32,6 +35,11 @@ class Book(Base, TimestampMixin):
     language: Mapped[str | None] = mapped_column(String(20))
     source_filename: Mapped[str | None] = mapped_column(String(500))
     source_file_uri: Mapped[str | None] = mapped_column(Text)
+
+    # Целостность импорта (Phase 1.5)
+    file_sha256: Mapped[str | None] = mapped_column(String(64))
+    file_size_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    import_report: Mapped[dict | None] = mapped_column(JSON)
 
     status: Mapped[str] = mapped_column(
         String(30),

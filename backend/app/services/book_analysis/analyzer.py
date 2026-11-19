@@ -1,233 +1,108 @@
-
 import logging
 import uuid
 
-from sqlalchemy import select
+from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
-from app.ai.providers import create_ai_provider
-
-from app.models.book import Book
-from app.models.chapter import Chapter
-from app.models.text_chunk import TextChunk
-
+from app.ai.errors import InvalidOutputError, classify
+from app.ai.providers import AIProvider, LLMCall, create_ai_provider
+from app.services.ai_usage import record_usage
 from app.services.book_analysis.prompts import (
     SYSTEM_PROMPT,
     build_chunk_prompt,
 )
 from app.services.book_analysis.schemas import BookAnalysisResult
-from app.services.book_analysis.persistence import save_analysis_result
 
 
 logger = logging.getLogger(__name__)
 
 
-class BookAnalyzer:
-    def __init__(self) -> None:
-        self.provider = create_ai_provider()
+def parse_analysis(call: LLMCall) -> BookAnalysisResult:
+    if call.finish_reason == "length":
+        raise InvalidOutputError(
+            "LLM output truncated (finish_reason=length); "
+            "increase AI_MAX_OUTPUT_TOKENS or reduce chunk size"
+        )
+    text = (call.text or "").strip()
+    if not text:
+        raise InvalidOutputError("LLM returned empty content")
+    # На случай, если модель всё же обернула JSON в ```json ... ```
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:]
+    try:
+        return BookAnalysisResult.model_validate_json(text)
+    except ValidationError as exc:
+        raise InvalidOutputError(f"Schema validation failed: {exc}") from exc
 
-    def analyze_chunk(
+
+class BookAnalyzer:
+    def __init__(self, provider: AIProvider | None = None) -> None:
+        self.provider = provider or create_ai_provider()
+
+    def call_llm(
         self,
         text: str,
         chapter_number: int,
         chunk_index: int,
-    ) -> BookAnalysisResult:
-        result, _ = self.analyze_chunk_with_usage(
+    ) -> LLMCall:
+        prompt = build_chunk_prompt(
             text=text,
             chapter_number=chapter_number,
             chunk_index=chunk_index,
         )
-        return result
+        return self.provider.complete_json(
+            system_prompt=SYSTEM_PROMPT,
+            user_prompt=prompt,
+            schema=BookAnalysisResult,
+        )
 
     def analyze_chunk_with_usage(
         self,
         text: str,
         chapter_number: int,
         chunk_index: int,
+        db: Session | None = None,
+        operation: str = "analyze_chunk_sync",
+        book_id: uuid.UUID | None = None,
     ) -> tuple[BookAnalysisResult, dict[str, int]]:
-        prompt = build_chunk_prompt(
-            text=text,
-            chapter_number=chapter_number,
-            chunk_index=chunk_index,
-        )
+        """Синхронный анализ одного фрагмента (preview / ручной режим).
 
-        response = self.provider.client.beta.chat.completions.parse(
-            model=self.provider.model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            response_format=BookAnalysisResult,
-        )
+        Если передан db — запрос записывается в ai_usage отдельной транзакцией.
+        """
+        call: LLMCall | None = None
+        try:
+            call = self.call_llm(text, chapter_number, chunk_index)
+            result = parse_analysis(call)
+        except Exception as exc:
+            if db is not None:
+                self._record(db, operation, book_id, call, exc)
+            raise
 
-        result = response.choices[0].message.parsed
+        if db is not None:
+            self._record(db, operation, book_id, call, None)
 
-        if result is None:
-            raise RuntimeError(
-                f"{self.provider.name} did not return structured analysis"
-            )
+        return result, call.usage.as_dict()
 
-        usage = response.usage
-        if usage is None:
-            raise RuntimeError(
-                f"{self.provider.name} did not return token usage"
-            )
-
-        return result, {
-            "input_tokens": usage.prompt_tokens,
-            "output_tokens": usage.completion_tokens,
-            "total_tokens": usage.total_tokens,
-        }
-
-    def analyze_book(
-        self,
-        db: Session,
-        book_id: uuid.UUID,
-        job_id: uuid.UUID | None = None,
-    ) -> dict:
-        book = db.scalar(
-            select(Book).where(Book.id == book_id)
-        )
-
-        if book is None:
-            raise ValueError("Book not found")
-
-        statement = (
-            select(Chapter, TextChunk)
-            .join(
-                TextChunk,
-                TextChunk.chapter_id == Chapter.id,
-            )
-            .where(Chapter.book_id == book_id)
-            .order_by(
-                Chapter.chapter_number,
-                TextChunk.chunk_index,
-            )
-        )
-
-        rows = db.execute(statement).all()
-
-        if not rows:
-            raise ValueError("Book has no text chunks")
-
-        totals = {
-            "processed_chunks": 0,
-            "failed_chunks": 0,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0,
-            "created": 0,
-            "matched": 0,
-            "attributes": 0,
-            "mentions": 0,
-            "relationships": 0,
-            "rejected_evidence": 0,
-            "unresolved_relationships": 0,
-            "ambiguous": [],
-            "errors": [],
-        }
-
-        
-        for chapter, chunk in rows:
-            logger.info(
-                "Analyzing book=%s chapter=%s chunk=%s",
-                book_id,
-                chapter.chapter_number,
-                chunk.chunk_index,
-            )
-
-            # Обновляем текущую позицию задачи.
-            if job_id is not None:
-                from app.models import AnalysisJob
-
-                job = db.query(AnalysisJob).filter(
-                    AnalysisJob.id == job_id
-                ).first()
-
-                if job is not None:
-                    job.current_chapter_number = chapter.chapter_number
-                    job.current_chunk_index = chunk.chunk_index
-                    db.commit()
-
-            try:
-                result, usage = self.analyze_chunk_with_usage(
-                    text=chunk.content,
-                    chapter_number=chapter.chapter_number,
-                    chunk_index=chunk.chunk_index,
+    def _record(self, db, operation, book_id, call, exc) -> None:
+        try:
+            record_usage(
+                    db,
+                    operation=operation,
+                    provider=self.provider.name,
+                    model=self.provider.model,
+                    status=(
+                        "ok" if exc is None
+                        else "invalid_output" if call is not None
+                        else "error"
+                    ),
+                    call=call,
+                    book_id=book_id,
+                    error_class=classify(exc).value if exc else None,
+                    error=str(exc) if exc else None,
                 )
-
-                for key in ("input_tokens", "output_tokens", "total_tokens"):
-                    totals[key] += usage[key]
-
-                report = save_analysis_result(
-                    db=db,
-                    project_id=book.project_id,
-                    result=result,
-                    chunk=chunk,
-                )
-
-                db.commit()
-
-                totals["processed_chunks"] += 1
-
-                for key in (
-                    "created",
-                    "matched",
-                    "attributes",
-                    "mentions",
-                    "relationships",
-                    "rejected_evidence",
-                    "unresolved_relationships",
-                ):
-                    totals[key] += report.get(key, 0)
-
-                totals["ambiguous"].extend(
-                    report.get("ambiguous", [])
-                )
-
-            except Exception as exc:
-                db.rollback()
-
-                totals["failed_chunks"] += 1
-
-                error = {
-                    "chapter_number": chapter.chapter_number,
-                    "chunk_index": chunk.chunk_index,
-                    "error": str(exc),
-                }
-
-                totals["errors"].append(error)
-
-                logger.exception(
-                    "Analysis failed for chapter=%s chunk=%s",
-                    chapter.chapter_number,
-                    chunk.chunk_index,
-                )
-
-            # Сохраняем прогресс после каждого фрагмента.
-            if job_id is not None:
-                from app.models import AnalysisJob
-
-                job = db.query(AnalysisJob).filter(
-                    AnalysisJob.id == job_id
-                ).first()
-
-                if job is not None:
-                    job.processed_chunks = totals["processed_chunks"]
-                    job.failed_chunks = totals["failed_chunks"]
-                    job.input_tokens = totals["input_tokens"]
-                    job.output_tokens = totals["output_tokens"]
-                    job.total_tokens = totals["total_tokens"]
-                    job.report = dict(totals)
-                    db.commit()
-
-        totals["status"] = (
-            "completed"
-            if totals["failed_chunks"] == 0
-            else "completed_with_errors"
-        )
-
-        totals["book_id"] = str(book_id)
-        totals["total_chunks"] = len(rows)
-
-        return totals
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("Failed to record AI usage")

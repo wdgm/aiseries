@@ -13,6 +13,10 @@ from app.models.character_reference import CharacterReference
 from app.models.character_relationship import CharacterRelationship
 from app.models.character_version import CharacterVersion
 from app.models.analysis_job import AnalysisJob
+from app.models.analysis_task import AnalysisTask, TaskStatus
+from app.models.provider_pricing import ProviderPricing
+from app.models.ai_usage import AIUsage
+
 __all__ = [
     "Base",
     "Project",
@@ -27,4 +31,8 @@ __all__ = [
     "CharacterRelationship",
     "CharacterVersion",
     "AnalysisJob",
+    "AnalysisTask",
+    "TaskStatus",
+    "ProviderPricing",
+    "AIUsage",
 ]

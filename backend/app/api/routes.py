@@ -5,7 +5,6 @@ from uuid import UUID
 
 from fastapi import (
     APIRouter,
-    BackgroundTasks,
     Depends,
     File,
     Form,
@@ -13,7 +12,8 @@ from fastapi import (
     UploadFile,
 )
 from pydantic import BaseModel, Field
-from sqlalchemy import or_
+from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.database import SessionLocal, check_database
@@ -27,12 +27,23 @@ from app.models.character_attribute import CharacterAttribute
 from app.models.character_mention import CharacterMention
 from app.models.character_reference import CharacterReference
 from app.models.character_relationship import CharacterRelationship
-from app.services.book_import.service import import_book
+from app.services.book_import.service import (
+    DuplicateBookError,
+    ImportIntegrityError,
+    import_book,
+)
 from app.services.book_analysis.analyzer import BookAnalyzer
 from app.services.book_analysis.persistence import save_analysis_result
 
-from app.models import AnalysisJob
-from app.services.book_analysis.analysis_job_service import run_analysis_job
+from app.models import AIUsage, AnalysisJob, AnalysisTask
+from app.services.book_analysis.queue import (
+    ActiveJobExistsError,
+    JobStateError,
+    cancel_job,
+    enqueue_analysis_job,
+    refresh_job,
+    resume_job,
+)
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
@@ -571,6 +582,17 @@ def create_project_with_book(
             },
         }
 
+    except ImportIntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "Import integrity check failed",
+                "errors": exc.result.errors,
+                "warnings": exc.result.warnings,
+            },
+        ) from exc
+
     except ValueError as exc:
         db.rollback()
         raise HTTPException(
@@ -723,7 +745,6 @@ def get_chapter(
 )
 def import_book_endpoint(
     project_id: UUID,
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     title: str | None = Form(default=None),
     author: str | None = Form(default=None),
@@ -748,21 +769,10 @@ def import_book_endpoint(
             author=author,
             language=language,
         )
-                # Создаём задачу автоматического анализа.
-        analysis_job = AnalysisJob(
-            book_id=book.id,
-            status="pending",
-        )
-
-        db.add(analysis_job)
+        # Ставим анализ в очередь; выполняет его сервис worker.
+        analysis_job = enqueue_analysis_job(db, book)
         db.commit()
         db.refresh(analysis_job)
-
-        # Запускаем анализ в фоне.
-        background_tasks.add_task(
-            run_analysis_job,
-            str(analysis_job.id),
-        )
 
         return {
             "status": "success",
@@ -776,13 +786,35 @@ def import_book_endpoint(
                 "source_filename": book.source_filename,
                 "status": book.status,
                 "chapters_count": len(book.chapters),
+                "file_sha256": book.file_sha256,
+                "import_report": book.import_report,
             },
-                        "analysis": {
+            "analysis": {
                 "job_id": str(analysis_job.id),
                 "status": analysis_job.status,
-                "message": "Book analysis started automatically",
+                "total_chunks": analysis_job.total_chunks,
+                "message": "Book analysis queued",
             },
         }
+
+    except DuplicateBookError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "existing_book_id": str(exc.book_id),
+            },
+        ) from exc
+
+    except ImportIntegrityError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "Import integrity check failed",
+                "errors": exc.result.errors,
+                "warnings": exc.result.warnings,
+            },
+        ) from exc
 
     except ValueError as exc:
         raise HTTPException(
@@ -850,6 +882,9 @@ def preview_book_analysis(
             text=chunk.content,
             chapter_number=chapter.chapter_number,
             chunk_index=chunk.chunk_index,
+            db=db,
+            operation="analyze_preview",
+            book_id=book.id,
         )
 
         return {
@@ -881,7 +916,6 @@ def preview_book_analysis(
 )
 def reanalyze_book(
     book_id: UUID,
-    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
     book = db.query(Book).filter(Book.id == book_id).first()
@@ -891,25 +925,33 @@ def reanalyze_book(
             detail="Book not found",
         )
 
-    job = AnalysisJob(
-        book_id=book.id,
-        status="pending",
-    )
+    try:
+        job = enqueue_analysis_job(db, book)
+        db.commit()
+    except ActiveJobExistsError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Book already has an active analysis job; resume or cancel it",
+                "job_id": str(exc.job_id),
+            },
+        ) from exc
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Book already has an active analysis job") from exc
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    db.add(job)
-    db.commit()
     db.refresh(job)
-
-    background_tasks.add_task(
-        run_analysis_job,
-        str(job.id),
-    )
 
     return {
         "status": "queued",
         "book_id": str(book.id),
         "job_id": str(job.id),
-        "message": "Book re-analysis started",
+        "message": "Book re-analysis queued (all chunks)",
+        "total_chunks": job.total_chunks,
     }
 
 
@@ -962,6 +1004,9 @@ def analyze_and_save_chunk(
             text=chunk.content,
             chapter_number=chapter.chapter_number,
             chunk_index=chunk.chunk_index,
+            db=db,
+            operation="analyze_chunk_manual",
+            book_id=book.id,
         )
 
         report = save_analysis_result(
@@ -1018,8 +1063,12 @@ def get_analysis_job(
         "processed_chunks": job.processed_chunks,
         "failed_chunks": job.failed_chunks,
         "input_tokens": job.input_tokens,
+        "cached_input_tokens": job.cached_input_tokens,
         "output_tokens": job.output_tokens,
         "total_tokens": job.total_tokens,
+        "cost_usd": str(job.cost_usd),
+        "cost_complete": job.unpriced_requests == 0,
+        "unpriced_requests": job.unpriced_requests,
         "progress_percent": (
             round(
                 (job.processed_chunks + job.failed_chunks)
@@ -1036,3 +1085,147 @@ def get_analysis_job(
         "started_at": job.started_at,
         "completed_at": job.completed_at,
     }
+
+
+# ---------------------------------------------------------------- Phase 1.5
+# Управление очередью анализа
+
+
+def _get_job_or_404(db: Session, job_id: UUID) -> AnalysisJob:
+    job = db.get(AnalysisJob, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Analysis job not found")
+    return job
+
+
+@router.post("/api/v1/analysis-jobs/{job_id}/resume", tags=["book-analysis"])
+def resume_analysis_job(job_id: UUID, db: Session = Depends(get_db)):
+    """Продолжить задачу: обработать только незавершённые/упавшие фрагменты."""
+    job = _get_job_or_404(db, job_id)
+    try:
+        result = resume_job(db, job)
+        db.commit()
+    except ActiveJobExistsError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail={"message": str(exc), "job_id": str(exc.job_id)},
+        ) from exc
+    except JobStateError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Book already has an active analysis job") from exc
+    refresh_job(db, job_id)
+    return {"status": "queued", "job_id": str(job_id), **result}
+
+
+@router.post("/api/v1/analysis-jobs/{job_id}/cancel", tags=["book-analysis"])
+def cancel_analysis_job(job_id: UUID, db: Session = Depends(get_db)):
+    job = _get_job_or_404(db, job_id)
+    try:
+        result = cancel_job(db, job)
+        db.commit()
+    except JobStateError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    refresh_job(db, job_id)
+    return {"status": "cancelled", "job_id": str(job_id), **result}
+
+
+@router.get("/api/v1/analysis-jobs/{job_id}/tasks", tags=["book-analysis"])
+def list_analysis_tasks(
+    job_id: UUID,
+    status: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+):
+    _get_job_or_404(db, job_id)
+    query = select(AnalysisTask).where(AnalysisTask.job_id == job_id)
+    if status:
+        query = query.where(AnalysisTask.status == status)
+    tasks = db.scalars(
+        query.order_by(AnalysisTask.chapter_number, AnalysisTask.chunk_index)
+        .limit(min(limit, 500))
+        .offset(offset)
+    ).all()
+    return [
+        {
+            "id": str(t.id),
+            "chapter_number": t.chapter_number,
+            "chunk_index": t.chunk_index,
+            "status": t.status,
+            "attempts": t.attempts,
+            "max_attempts": t.max_attempts,
+            "next_run_at": t.next_run_at,
+            "locked_by": t.locked_by,
+            "error_class": t.error_class,
+            "last_error": t.last_error,
+            "has_cached_llm_result": t.llm_result is not None,
+            "report": t.report,
+            "started_at": t.started_at,
+            "finished_at": t.finished_at,
+        }
+        for t in tasks
+    ]
+
+
+@router.get("/api/v1/books/{book_id}/analysis-jobs", tags=["book-analysis"])
+def list_book_analysis_jobs(book_id: UUID, db: Session = Depends(get_db)):
+    jobs = db.scalars(
+        select(AnalysisJob)
+        .where(AnalysisJob.book_id == book_id)
+        .order_by(AnalysisJob.created_at.desc())
+    ).all()
+    return [
+        {
+            "id": str(j.id),
+            "status": j.status,
+            "total_chunks": j.total_chunks,
+            "processed_chunks": j.processed_chunks,
+            "failed_chunks": j.failed_chunks,
+            "cost_usd": str(j.cost_usd),
+            "last_error": j.last_error,
+            "created_at": j.created_at,
+            "completed_at": j.completed_at,
+        }
+        for j in jobs
+    ]
+
+
+@router.get("/api/v1/ai-usage/summary", tags=["ai-usage"])
+def ai_usage_summary(
+    job_id: UUID | None = None,
+    book_id: UUID | None = None,
+    db: Session = Depends(get_db),
+):
+    """Расходы по провайдеру/модели/операции/статусу. cost_usd=null — цена неизвестна."""
+    query = select(
+        AIUsage.provider,
+        AIUsage.model,
+        AIUsage.operation,
+        AIUsage.status,
+        func.count().label("requests"),
+        func.sum(AIUsage.input_tokens).label("input_tokens"),
+        func.sum(AIUsage.cached_input_tokens).label("cached_input_tokens"),
+        func.sum(AIUsage.output_tokens).label("output_tokens"),
+        func.sum(AIUsage.reasoning_tokens).label("reasoning_tokens"),
+        func.sum(AIUsage.cost_usd).label("cost_usd"),
+        func.count().filter(AIUsage.cost_usd.is_(None)).label("unpriced_requests"),
+        func.avg(AIUsage.latency_ms).label("avg_latency_ms"),
+    ).group_by(AIUsage.provider, AIUsage.model, AIUsage.operation, AIUsage.status)
+    if job_id:
+        query = query.where(AIUsage.job_id == job_id)
+    if book_id:
+        query = query.where(AIUsage.book_id == book_id)
+    rows = db.execute(query).mappings().all()
+    return [
+        {
+            **{k: v for k, v in row.items() if k not in ("cost_usd", "avg_latency_ms")},
+            "cost_usd": str(row["cost_usd"]) if row["cost_usd"] is not None else None,
+            "avg_latency_ms": int(row["avg_latency_ms"]) if row["avg_latency_ms"] else None,
+        }
+        for row in rows
+    ]

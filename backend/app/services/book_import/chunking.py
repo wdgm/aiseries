@@ -6,6 +6,9 @@ class TextPart:
     index: int
     content: str
     token_count: int
+    # Позиция в ИСХОДНОМ тексте: text[char_start:char_end] == content
+    char_start: int = 0
+    char_end: int = 0
 
 
 def split_into_chunks(
@@ -19,6 +22,7 @@ def split_into_chunks(
     if overlap < 0 or overlap >= chunk_size:
         raise ValueError("overlap должен быть меньше chunk_size")
 
+    base = len(text) - len(text.lstrip())
     text = text.strip()
 
     if not text:
@@ -41,14 +45,19 @@ def split_into_chunks(
             if boundary > start + chunk_size // 2:
                 end = boundary + 1
 
-        content = text[start:end].strip()
+        raw = text[start:end]
+        content = raw.strip()
 
         if content:
+            lead = len(raw) - len(raw.lstrip())
+            char_start = base + start + lead
             chunks.append(
                 TextPart(
                     index=index,
                     content=content,
                     token_count=max(1, len(content) // 4),
+                    char_start=char_start,
+                    char_end=char_start + len(content),
                 )
             )
 
