@@ -23,9 +23,13 @@ def create_ai_provider() -> AIProvider:
         api_key = settings.openai_api_key
         model = settings.openai_model
         base_url = None
+    elif provider_name == "deepseek":
+        api_key = settings.deepseek_api_key
+        model = settings.deepseek_model
+        base_url = "https://openrouter.ai/api/v1"
     else:
         raise ValueError(
-            "AI_PROVIDER must be either 'groq' or 'openai'"
+            "AI_PROVIDER must be 'groq', 'openai', or 'deepseek'"
         )
 
     if not api_key:

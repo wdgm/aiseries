@@ -10,9 +10,11 @@
 ## Первый запуск
 
 1. Скопируйте `.env.example` в `.env`.
-2. Выберите провайдера через `AI_PROVIDER=groq` или `AI_PROVIDER=openai`,
-   укажите соответствующий ключ (`GROQ_API_KEY` или `OPENAI_API_KEY`) и при
-   необходимости задайте модель (`GROQ_MODEL` или `OPENAI_MODEL`).
+2. Выберите провайдера через `AI_PROVIDER=groq`, `AI_PROVIDER=openai` или
+   `AI_PROVIDER=deepseek`, укажите соответствующий ключ (`GROQ_API_KEY`,
+   `OPENAI_API_KEY` или `DEEPSEEK_API_KEY`) и при необходимости задайте модель
+   (`GROQ_MODEL`, `OPENAI_MODEL` или `DEEPSEEK_MODEL`). Провайдер `deepseek`
+   использует API OpenRouter.
 3. При желании измените локальный пароль PostgreSQL в `.env`.
 4. Запустите:
 

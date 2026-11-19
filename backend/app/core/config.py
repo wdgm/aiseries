@@ -13,6 +13,8 @@ class Settings(BaseSettings):
     groq_model: str = "openai/gpt-oss-20b"
     openai_api_key: str | None = None
     openai_model: str = "gpt-4o-mini"
+    deepseek_api_key: str | None = None
+    deepseek_model: str = "deepseek/deepseek-v4.1-flash"
     ai_timeout_seconds: int = 120
 
     model_config = SettingsConfigDict(
