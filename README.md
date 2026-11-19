@@ -10,8 +10,11 @@
 ## Первый запуск
 
 1. Скопируйте `.env.example` в `.env`.
-2. При желании измените локальный пароль PostgreSQL в `.env`.
-3. Запустите:
+2. Выберите провайдера через `AI_PROVIDER=groq` или `AI_PROVIDER=openai`,
+   укажите соответствующий ключ (`GROQ_API_KEY` или `OPENAI_API_KEY`) и при
+   необходимости задайте модель (`GROQ_MODEL` или `OPENAI_MODEL`).
+3. При желании измените локальный пароль PostgreSQL в `.env`.
+4. Запустите:
 
    ```bash
    docker compose up --build
@@ -25,6 +28,9 @@
    - Проверка БД: http://localhost:8000/health/db
 
 Остановка: `docker compose down`.
+
+Чтобы сменить провайдера, измените `AI_PROVIDER` и соответствующий ключ в `.env`,
+затем перезапустите backend: `docker compose up --build -d backend`.
 
 Остановка с удалением локальных данных БД: `docker compose down -v`.
 
