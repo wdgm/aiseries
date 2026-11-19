@@ -34,6 +34,15 @@ class AnalysisJob(TimestampMixin, Base):
         index=True,
     )
 
+    # characters — персонажи/упоминания/отношения (основной проход);
+    # story_elements — события и локации (второй проход, опирается на персонажей).
+    job_type: Mapped[str] = mapped_column(
+        String(40),
+        nullable=False,
+        default="characters",
+        server_default="characters",
+    )
+
     status: Mapped[str] = mapped_column(
         String(30),
         nullable=False,

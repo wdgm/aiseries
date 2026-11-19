@@ -1058,6 +1058,7 @@ def get_analysis_job(
     return {
         "id": str(job.id),
         "book_id": str(job.book_id),
+        "job_type": job.job_type,
         "status": job.status,
         "total_chunks": job.total_chunks,
         "processed_chunks": job.processed_chunks,
@@ -1182,7 +1183,13 @@ def list_book_analysis_jobs(book_id: UUID, db: Session = Depends(get_db)):
     return [
         {
             "id": str(j.id),
+            "job_type": j.job_type,
             "status": j.status,
+            "progress_percent": (
+                round((j.processed_chunks + j.failed_chunks) / j.total_chunks * 100, 1)
+                if j.total_chunks
+                else 0
+            ),
             "total_chunks": j.total_chunks,
             "processed_chunks": j.processed_chunks,
             "failed_chunks": j.failed_chunks,

@@ -89,6 +89,14 @@ def make_book(db, tmp_path, chapters=3, chunks_per_chapter=4) -> Book:
     return import_book(db, project.id, "book.txt", data, title="Тест", storage_dir=tmp_path), data
 
 
+@pytest.fixture(autouse=True)
+def _no_story_pass(monkeypatch):
+    # Эти тесты считают вызовы LLM первого прохода; второй проход — в test_story_elements.
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "story_auto_enqueue", False)
+
+
 @pytest.fixture
 def db():
     session = SessionLocal()

@@ -34,6 +34,13 @@ class Settings(BaseSettings):
     worker_lease_seconds: int = 300
     task_max_attempts: int = 4
 
+    # --- Phase 2: события и локации ------------------------------------
+    # После завершения анализа персонажей автоматически ставить второй проход.
+    story_auto_enqueue: bool = True
+    # Сколько известных персонажей/локаций передавать модели как контекст.
+    story_context_max_characters: int = 60
+    story_context_max_locations: int = 60
+
     model_config = SettingsConfigDict(
         env_file=".env",
         extra="ignore",

@@ -29,8 +29,10 @@ from app.core.config import settings
 from app.core.database import SessionLocal, engine
 from app.models import AnalysisJob, AnalysisTask, Book, Chapter, TaskStatus, TextChunk
 from app.services.ai_usage import record_usage
-from app.services.book_analysis.analyzer import BookAnalyzer, parse_analysis
+from app.services.book_analysis.analyzer import BookAnalyzer, parse_analysis, parse_story
 from app.services.book_analysis.persistence import save_analysis_result
+from app.services.book_analysis.story_persistence import load_story_context, save_story_elements
+from app.services.book_analysis.story_schemas import StoryElementsResult
 from app.services.book_analysis.queue import (
     claim_tasks,
     lock_owned_task,
@@ -42,6 +44,10 @@ from app.services.book_analysis.queue import (
 from app.services.book_analysis.schemas import BookAnalysisResult
 
 logger = logging.getLogger("app.worker")
+
+TASK_CHARACTERS = "analyze_chunk"
+TASK_STORY = "extract_story_elements"
+RESULT_MODELS = {TASK_CHARACTERS: BookAnalysisResult, TASK_STORY: StoryElementsResult}
 
 
 class Worker:
@@ -135,18 +141,24 @@ class Worker:
                 self._fail(task_id, job_id, exc)
                 return
             book_id, project_id, chunk_content = ctx
+            task_type = task.task_type or TASK_CHARACTERS
+            chapter_number = task.chapter_number
             cached = task.llm_result
+            if task_type not in RESULT_MODELS:
+                db.rollback()
+                self._fail(task_id, job_id, TaskDataError(f"Unknown task_type {task_type}"))
+                return
             db.commit()
 
         # 1) LLM (вне транзакции; результат + usage фиксируются сразу)
         if cached is None:
-            logger.info("LLM %s", log)
-            result = self._call_llm(task_id, job_id, book_id, chunk_content)
+            logger.info("LLM %s type=%s", log, task_type)
+            result = self._call_llm(task_id, job_id, book_id, chunk_content, task_type, project_id)
             if result is None:
                 return
         else:
             logger.info("Using cached LLM result %s", log)
-            result = BookAnalysisResult.model_validate(cached)
+            result = RESULT_MODELS[task_type].model_validate(cached)
 
         # 2) Сохранение + succeeded — атомарно
         with SessionLocal() as db:
@@ -170,9 +182,19 @@ class Worker:
                     {"k": f"persist:project:{project_id}"},
                 )
                 chunk = db.get(TextChunk, task.chunk_id)
-                report = save_analysis_result(
-                    db=db, project_id=project_id, result=result, chunk=chunk
-                )
+                if task_type == TASK_STORY:
+                    report = save_story_elements(
+                        db=db,
+                        project_id=project_id,
+                        book_id=book_id,
+                        chapter_number=chapter_number,
+                        result=result,
+                        chunk=chunk,
+                    )
+                else:
+                    report = save_analysis_result(
+                        db=db, project_id=project_id, result=result, chunk=chunk
+                    )
                 task.status = TaskStatus.SUCCEEDED
                 task.report = _jsonable(report)
                 task.finished_at = utcnow()
@@ -202,23 +224,38 @@ class Worker:
         content, book_id, project_id = row
         return book_id, project_id, content
 
-    def _call_llm(self, task_id, job_id, book_id, content) -> BookAnalysisResult | None:
+    def _call_llm(self, task_id, job_id, book_id, content, task_type=TASK_CHARACTERS, project_id=None):
         with SessionLocal() as db:
             task = db.get(AnalysisTask, task_id)
             chapter_number, chunk_index = task.chapter_number, task.chunk_index
+            if task_type == TASK_STORY:
+                known_characters, known_locations = load_story_context(
+                    db,
+                    project_id,
+                    book_id,
+                    settings.story_context_max_characters,
+                    settings.story_context_max_locations,
+                )
 
+        operation = "extract_story_elements" if task_type == TASK_STORY else "analyze_chunk"
         provider = self.analyzer.provider
         call: LLMCall | None = None
         started = time.monotonic()
         try:
-            call = self.analyzer.call_llm(content, chapter_number, chunk_index)
-            result = parse_analysis(call)
+            if task_type == TASK_STORY:
+                call = self.analyzer.call_story_llm(
+                    content, chapter_number, chunk_index, known_characters, known_locations
+                )
+                result = parse_story(call)
+            else:
+                call = self.analyzer.call_llm(content, chapter_number, chunk_index)
+                result = parse_analysis(call)
         except Exception as exc:
             cls = classify(exc)
             with SessionLocal() as db:
                 record_usage(
                     db,
-                    operation="analyze_chunk",
+                    operation=operation,
                     provider=provider.name,
                     model=provider.model,
                     status="invalid_output" if call is not None else "error",
@@ -239,7 +276,7 @@ class Worker:
         with SessionLocal() as db:
             record_usage(
                 db,
-                operation="analyze_chunk",
+                operation=operation,
                 provider=provider.name,
                 model=provider.model,
                 status="ok",

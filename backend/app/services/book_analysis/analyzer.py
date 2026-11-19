@@ -12,12 +12,14 @@ from app.services.book_analysis.prompts import (
     build_chunk_prompt,
 )
 from app.services.book_analysis.schemas import BookAnalysisResult
+from app.services.book_analysis.story_prompts import STORY_SYSTEM_PROMPT, build_story_prompt
+from app.services.book_analysis.story_schemas import StoryElementsResult
 
 
 logger = logging.getLogger(__name__)
 
 
-def parse_analysis(call: LLMCall) -> BookAnalysisResult:
+def parse_structured(call: LLMCall, model_cls):
     if call.finish_reason == "length":
         raise InvalidOutputError(
             "LLM output truncated (finish_reason=length); "
@@ -32,9 +34,17 @@ def parse_analysis(call: LLMCall) -> BookAnalysisResult:
         if text.lower().startswith("json"):
             text = text[4:]
     try:
-        return BookAnalysisResult.model_validate_json(text)
+        return model_cls.model_validate_json(text)
     except ValidationError as exc:
         raise InvalidOutputError(f"Schema validation failed: {exc}") from exc
+
+
+def parse_analysis(call: LLMCall) -> BookAnalysisResult:
+    return parse_structured(call, BookAnalysisResult)
+
+
+def parse_story(call: LLMCall) -> StoryElementsResult:
+    return parse_structured(call, StoryElementsResult)
 
 
 class BookAnalyzer:
@@ -56,6 +66,27 @@ class BookAnalyzer:
             system_prompt=SYSTEM_PROMPT,
             user_prompt=prompt,
             schema=BookAnalysisResult,
+        )
+
+    def call_story_llm(
+        self,
+        text: str,
+        chapter_number: int,
+        chunk_index: int,
+        known_characters: list[str],
+        known_locations: list[str],
+    ) -> LLMCall:
+        prompt = build_story_prompt(
+            text=text,
+            chapter_number=chapter_number,
+            chunk_index=chunk_index,
+            known_characters=known_characters,
+            known_locations=known_locations,
+        )
+        return self.provider.complete_json(
+            system_prompt=STORY_SYSTEM_PROMPT,
+            user_prompt=prompt,
+            schema=StoryElementsResult,
         )
 
     def analyze_chunk_with_usage(

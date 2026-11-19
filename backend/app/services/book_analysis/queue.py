@@ -28,17 +28,16 @@ from app.models import (
 )
 
 ACTIVE_JOB_STATUSES = ("queued", "running", "paused")
+DONE_JOB_STATUSES = ("completed", "completed_with_errors")
+
+JOB_CHARACTERS = "characters"
+JOB_STORY = "story_elements"
+TASK_TYPE_BY_JOB = {
+    JOB_CHARACTERS: "analyze_chunk",
+    JOB_STORY: "extract_story_elements",
+}
 CLAIMABLE_JOB_STATUSES = ("queued", "running")
 
-REPORT_INT_KEYS = (
-    "created",
-    "matched",
-    "attributes",
-    "mentions",
-    "relationships",
-    "rejected_evidence",
-    "unresolved_relationships",
-)
 
 
 class ActiveJobExistsError(Exception):
@@ -64,8 +63,42 @@ def find_active_job(db: Session, book_id: uuid.UUID) -> AnalysisJob | None:
     )
 
 
-def enqueue_analysis_job(db: Session, book: Book) -> AnalysisJob:
+def find_done_job(db: Session, book_id: uuid.UUID, job_type: str) -> AnalysisJob | None:
+    return db.scalar(
+        select(AnalysisJob)
+        .where(
+            AnalysisJob.book_id == book_id,
+            AnalysisJob.job_type == job_type,
+            AnalysisJob.status.in_(DONE_JOB_STATUSES),
+        )
+        .order_by(AnalysisJob.completed_at.desc().nulls_last())
+        .limit(1)
+    )
+
+
+def enqueue_story_job(db: Session, book: Book, force: bool = False) -> AnalysisJob:
+    """Второй проход (события + локации). Требует завершённого анализа персонажей.
+
+    Без force повторный запуск запрещён: события уже есть, второй проход по тем же
+    фрагментам только потратил бы деньги (дубли всё равно отсеиваются по позиции).
+    """
+    if find_done_job(db, book.id, JOB_CHARACTERS) is None:
+        raise JobStateError(
+            "Character analysis must be completed before extracting events and locations"
+        )
+    if not force and find_done_job(db, book.id, JOB_STORY) is not None:
+        raise JobStateError(
+            "Events and locations are already extracted for this book; pass force=true to re-run"
+        )
+    return enqueue_analysis_job(db, book, job_type=JOB_STORY)
+
+
+def enqueue_analysis_job(
+    db: Session, book: Book, job_type: str = JOB_CHARACTERS
+) -> AnalysisJob:
     """Создаёт задачу и по одной подзадаче на каждый фрагмент. Commit — у вызывающего."""
+    if job_type not in TASK_TYPE_BY_JOB:
+        raise ValueError(f"Unknown job_type {job_type}")
     active = find_active_job(db, book.id)
     if active is not None:
         raise ActiveJobExistsError(active.id)
@@ -81,6 +114,7 @@ def enqueue_analysis_job(db: Session, book: Book) -> AnalysisJob:
 
     job = AnalysisJob(
         book_id=book.id,
+        job_type=job_type,
         status="queued",
         total_chunks=len(rows),
         report={},
@@ -95,7 +129,7 @@ def enqueue_analysis_job(db: Session, book: Book) -> AnalysisJob:
             {
                 "id": uuid.uuid4(),
                 "job_id": job.id,
-                "task_type": "analyze_chunk",
+                "task_type": TASK_TYPE_BY_JOB[job_type],
                 "chunk_id": chunk_id,
                 "chapter_number": chapter_number,
                 "chunk_index": chunk_index,
@@ -326,22 +360,49 @@ def refresh_job(db: Session, job_id: uuid.UUID) -> AnalysisJob | None:
 
     job.report = _build_report(db, job_id, counts)
     db.commit()
+
+    if finished and job.job_type == JOB_CHARACTERS and settings.story_auto_enqueue:
+        _auto_enqueue_story(db, job.book_id)
     return job
 
 
+def _auto_enqueue_story(db: Session, book_id: uuid.UUID) -> None:
+    """Персонажи готовы → ставим второй проход, если его ещё не было."""
+    import logging
+
+    log = logging.getLogger(__name__)
+    try:
+        book = db.get(Book, book_id)
+        if book is None:
+            return
+        story = enqueue_story_job(db, book)
+        db.commit()
+        log.info("Auto-enqueued story_elements job %s for book %s", story.id, book_id)
+    except (JobStateError, ActiveJobExistsError) as exc:
+        db.rollback()
+        log.info("Story job not auto-enqueued for book %s: %s", book_id, exc)
+    except Exception:
+        db.rollback()
+        log.exception("Failed to auto-enqueue story job for book %s", book_id)
+
+
 def _build_report(db: Session, job_id: uuid.UUID, counts: Counter) -> dict:
-    totals: dict = {key: 0 for key in REPORT_INT_KEYS}
-    totals["ambiguous"] = []
+    # Суммируем все числовые счётчики подзадач (у разных типов задач они разные).
+    totals: dict = {}
+    ambiguous: list = []
     for (report,) in db.execute(
         select(AnalysisTask.report).where(
             AnalysisTask.job_id == job_id,
             AnalysisTask.status == TaskStatus.SUCCEEDED,
         )
     ):
-        report = report or {}
-        for key in REPORT_INT_KEYS:
-            totals[key] += int(report.get(key, 0) or 0)
-        totals["ambiguous"].extend(report.get("ambiguous", []))
+        for key, value in (report or {}).items():
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int):
+                totals[key] = totals.get(key, 0) + value
+        ambiguous.extend((report or {}).get("ambiguous", []))
+    totals["ambiguous"] = ambiguous[:500]
 
     totals["errors"] = [
         {

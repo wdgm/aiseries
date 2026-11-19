@@ -16,6 +16,8 @@ from app.models.analysis_job import AnalysisJob
 from app.models.analysis_task import AnalysisTask, TaskStatus
 from app.models.provider_pricing import ProviderPricing
 from app.models.ai_usage import AIUsage
+from app.models.location import Location, LocationAlias, LocationAttribute, LocationMention
+from app.models.story_event import EventParticipant, StoryEvent
 
 __all__ = [
     "Base",
@@ -35,4 +37,10 @@ __all__ = [
     "TaskStatus",
     "ProviderPricing",
     "AIUsage",
+    "Location",
+    "LocationAlias",
+    "LocationAttribute",
+    "LocationMention",
+    "StoryEvent",
+    "EventParticipant",
 ]

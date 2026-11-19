@@ -27,7 +27,9 @@ type ChapterDetail = {
 type AnalysisJob = {
   id: string;
   book_id: string;
+  job_type?: string;
   status: string;
+  cost_usd?: string;
   total_chunks: number;
   processed_chunks: number;
   failed_chunks: number;
@@ -47,6 +49,46 @@ type AnalysisResult = {
   analysis?: { characters?: Array<{ name: string; description?: string | null; character_type: string; importance: string; aliases: string[]; attributes: Array<{ category: string; value: string }>; relationships: Array<{ target_character_name: string; relationship_type: string }> }> };
   report?: Record<string, unknown>;
 };
+
+type StoryParticipant = { character_id: string | null; name: string; raw_name: string; role: string | null; match_status: string };
+type StoryEvent = {
+  id: string;
+  chapter_number: number | null;
+  title: string;
+  description: string;
+  event_type: string;
+  importance: string;
+  is_turning_point: boolean;
+  is_climax: boolean;
+  time_text: string | null;
+  cause: string | null;
+  consequences: string | null;
+  location: { id: string; name: string } | null;
+  raw_location_name: string | null;
+  participants: StoryParticipant[];
+  evidence: string;
+  confidence: number | null;
+  status: string;
+};
+type LocationItem = {
+  id: string;
+  canonical_name: string;
+  location_type: string;
+  description: string | null;
+  status: string;
+  aliases: string[];
+  attributes: Array<{ id: string; category: string; value: string; evidence: string }>;
+  mentions_count: number;
+  events_count: number;
+};
+type BookJobSummary = { id: string; job_type: string; status: string };
+
+const ACTIVE_JOB_STATUSES = ["pending", "queued", "running", "paused"];
+const POLLED_JOB_STATUSES = ["pending", "queued", "running", "paused"];
+const DONE_JOB_STATUSES = ["completed", "completed_with_errors", "failed", "cancelled"];
+const EVENT_TYPE_LABELS: Record<string, string> = { plot: "Сюжет", character: "Персонаж", background: "Предыстория" };
+const LOCATION_TYPE_LABELS: Record<string, string> = { city: "Город", settlement: "Поселение", building: "Здание", room: "Помещение", nature: "Природа", region: "Регион", vehicle: "Транспорт", other: "Другое" };
+const LOCATION_ATTR_LABELS: Record<string, string> = { geography: "География", architecture: "Архитектура", environment: "Окружение", atmosphere: "Атмосфера", time_context: "Время", other: "Другое" };
 
 type CharacterAlias = { id: string; alias: string; alias_type: string };
 type CharacterAttribute = { id: string; key: string; value: string; evidence?: string | null; confidence?: number | null; status?: string; source_chapter_id?: string | null };
@@ -148,6 +190,11 @@ export default function Home() {
   const [actionError, setActionError] = useState("");
   const [notice, setNotice] = useState("");
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [storyEvents, setStoryEvents] = useState<StoryEvent[]>([]);
+  const [storyEventsTotal, setStoryEventsTotal] = useState(0);
+  const [locations, setLocations] = useState<LocationItem[]>([]);
+  const [storyTab, setStoryTab] = useState<"events" | "locations">("events");
+  const [eventImportance, setEventImportance] = useState("all");
 
   const selectedProject = projects.find((project) => project.id === projectId) ?? null;
   const selectedBook = books.find((book) => book.id === selectedBookId) ?? null;
@@ -211,6 +258,24 @@ export default function Home() {
     const list = await apiRequest<Book[]>(`/api/v1/projects/${id}/books`);
     setBooks(list);
     setSelectedBookId((current) => (current && list.some((book) => book.id === current) ? current : list[0]?.id ?? ""));
+  }, []);
+
+  const loadStory = useCallback(async (bookId: string, projId: string) => {
+    if (!bookId || !projId) return;
+    const [events, locs] = await Promise.all([
+      apiRequest<{ total: number; items: StoryEvent[] }>(`/api/v1/books/${bookId}/events?limit=500`),
+      apiRequest<LocationItem[]>(`/api/v1/projects/${projId}/locations`),
+    ]);
+    setStoryEvents(events.items);
+    setStoryEventsTotal(events.total);
+    setLocations(locs);
+  }, []);
+
+  const loadLatestJob = useCallback(async (bookId: string) => {
+    const list = await apiRequest<BookJobSummary[]>(`/api/v1/books/${bookId}/analysis-jobs`);
+    const latest = list.find((item) => ACTIVE_JOB_STATUSES.includes(item.status)) ?? list[0];
+    if (!latest) return null;
+    return apiRequest<AnalysisJob>(`/api/v1/analysis-jobs/${latest.id}`);
   }, []);
 
   const loadCharacters = useCallback(async (id: string) => {
@@ -317,6 +382,22 @@ export default function Home() {
   }, [selectedBookId]);
 
   useEffect(() => {
+    if (!selectedBookId) {
+      setStoryEvents([]);
+      setStoryEventsTotal(0);
+      return;
+    }
+    let active = true;
+    loadLatestJob(selectedBookId)
+      .then((latest) => { if (active && latest) setJob((current) => (current?.id === latest.id ? current : latest)); })
+      .catch(() => undefined);
+    if (projectId) {
+      loadStory(selectedBookId, projectId).catch((error: Error) => { if (active) setActionError(`Не удалось загрузить события: ${error.message}`); });
+    }
+    return () => { active = false; };
+  }, [selectedBookId, projectId, loadLatestJob, loadStory]);
+
+  useEffect(() => {
     if (!selectedCharacter) {
       setCharacterDraft("");
       return;
@@ -325,15 +406,22 @@ export default function Home() {
   }, [selectedCharacter]);
 
   useEffect(() => {
-    if (!job || !["pending", "running"].includes(job.status)) return;
+    if (!job || !POLLED_JOB_STATUSES.includes(job.status)) return;
     let active = true;
     const timer = window.setInterval(() => {
       apiRequest<AnalysisJob>(`/api/v1/analysis-jobs/${job.id}`)
-        .then((result) => {
+        .then(async (result) => {
           if (!active) return;
           setJob(result);
-          if (["completed", "completed_with_errors", "failed"].includes(result.status)) {
+          if (DONE_JOB_STATUSES.includes(result.status)) {
             if (result.status !== "failed") void loadBooks(projectId);
+            if (projectId) {
+              void loadCharacters(projectId);
+              void loadStory(result.book_id, projectId);
+            }
+            // После персонажей автоматически стартует второй проход — переключаемся на него.
+            const next = await loadLatestJob(result.book_id);
+            if (active && next && next.id !== result.id && ACTIVE_JOB_STATUSES.includes(next.status)) setJob(next);
           }
         })
         .catch((error: Error) => {
@@ -342,7 +430,7 @@ export default function Home() {
     }, 2500);
 
     return () => { active = false; window.clearInterval(timer); };
-  }, [job, loadBooks, projectId]);
+  }, [job, loadBooks, loadCharacters, loadLatestJob, loadStory, projectId]);
 
   async function openChapter(chapter: Chapter) {
     setActionError("");
@@ -397,6 +485,7 @@ export default function Home() {
       setJob({
         id: result.analysis.job_id,
         book_id: result.book.id,
+        job_type: "characters",
         status: result.analysis.status,
         total_chunks: 0,
         processed_chunks: 0,
@@ -459,7 +548,8 @@ export default function Home() {
       setJob({
         id: result.job_id,
         book_id: selectedBook.id,
-        status: "pending",
+        job_type: "characters",
+        status: "queued",
         total_chunks: 0,
         processed_chunks: 0,
         failed_chunks: 0,
@@ -481,6 +571,63 @@ export default function Home() {
       setActionError(`Не удалось запустить повторный анализ: ${(error as Error).message}`);
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function resumeJob() {
+    if (!job) return;
+    setBusy(true);
+    setActionError("");
+    try {
+      await apiRequest(`/api/v1/analysis-jobs/${job.id}/resume`, { method: "POST" });
+      setJob(await apiRequest<AnalysisJob>(`/api/v1/analysis-jobs/${job.id}`));
+      setNotice("Анализ продолжен: обработаются только незавершённые фрагменты.");
+    } catch (error) {
+      setActionError(`Не удалось продолжить анализ: ${(error as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function startStoryExtraction(force = false) {
+    if (!selectedBook) return;
+    setBusy(true);
+    setActionError("");
+    try {
+      const result = await apiRequest<{ job_id: string }>(`/api/v1/books/${selectedBook.id}/analyze/story-elements${force ? "?force=true" : ""}`, { method: "POST" });
+      setJob(await apiRequest<AnalysisJob>(`/api/v1/analysis-jobs/${result.job_id}`));
+      setNotice("Извлечение событий и локаций запущено.");
+    } catch (error) {
+      setActionError(`Не удалось запустить извлечение: ${(error as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function setEventStatus(eventId: string, status: string) {
+    try {
+      const updated = await apiRequest<StoryEvent>(`/api/v1/events/${eventId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status }),
+      });
+      setStoryEvents((list) => (status === "rejected" ? list.filter((item) => item.id !== eventId) : list.map((item) => (item.id === eventId ? updated : item))));
+      if (status === "rejected") setStoryEventsTotal((total) => Math.max(0, total - 1));
+    } catch (error) {
+      setActionError(`Не удалось обновить событие: ${(error as Error).message}`);
+    }
+  }
+
+  async function setLocationStatus(locationId: string, status: string) {
+    try {
+      await apiRequest(`/api/v1/locations/${locationId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status }),
+      });
+      setLocations((list) => (status === "rejected" ? list.filter((item) => item.id !== locationId) : list.map((item) => (item.id === locationId ? { ...item, status } : item))));
+    } catch (error) {
+      setActionError(`Не удалось обновить локацию: ${(error as Error).message}`);
     }
   }
 
@@ -580,7 +727,22 @@ export default function Home() {
     }
   }
 
-  const completedJob = job && ["completed", "completed_with_errors", "failed"].includes(job.status);
+  const completedJob = job && DONE_JOB_STATUSES.includes(job.status);
+  const pausedJob = job?.status === "paused";
+  const storyJob = job?.job_type === "story_elements";
+  const jobActive = !!job && ACTIVE_JOB_STATUSES.includes(job.status) && job.book_id === selectedBookId;
+  const filteredEvents = eventImportance === "all" ? storyEvents : storyEvents.filter((item) => item.importance === eventImportance || (eventImportance === "turning" && (item.is_turning_point || item.is_climax)));
+  const jobTitle = job
+    ? job.status === "failed"
+      ? "Не удалось завершить анализ"
+      : job.status === "cancelled"
+        ? "Анализ отменён"
+        : pausedJob
+          ? "Анализ на паузе"
+          : completedJob
+            ? storyJob ? "События и локации извлечены" : "Анализ персонажей завершён"
+            : storyJob ? "ИИ извлекает события и локации" : "ИИ изучает персонажей книги"
+    : "";
 
   return (
     <main className="app-shell">
@@ -654,10 +816,11 @@ export default function Home() {
             <section className={`analysis-banner ${completedJob ? "analysis-done" : ""}`}>
               <div className="analysis-icon"><Icon name={completedJob ? (job.status === "failed" ? "close" : "check") : "sparkles"} size={19} /></div>
               <div className="analysis-copy">
-                <strong>{job.status === "failed" ? "Не удалось завершить анализ" : completedJob ? "Анализ книги завершён" : "ИИ изучает вашу книгу"}</strong>
-                <span>{job.status === "failed" ? job.last_error : completedJob ? `${formatNumber(job.processed_chunks)} фрагментов обработано${job.failed_chunks ? ` · ${job.failed_chunks} с ошибкой` : ""}` : `Фрагмент ${job.processed_chunks + 1}${job.total_chunks ? ` из ${formatNumber(job.total_chunks)}` : ""} · это может занять несколько минут`}</span>
-                <span>Токены: {formatNumber(job.total_tokens)} всего · {formatNumber(job.input_tokens)} входящих · {formatNumber(job.output_tokens)} исходящих</span>
+                <strong>{jobTitle}</strong>
+                <span>{job.status === "failed" || pausedJob ? job.last_error : completedJob ? `${formatNumber(job.processed_chunks)} фрагментов обработано${job.failed_chunks ? ` · ${job.failed_chunks} с ошибкой` : ""}` : `Фрагмент ${job.processed_chunks + 1}${job.total_chunks ? ` из ${formatNumber(job.total_chunks)}` : ""} · это может занять несколько минут`}</span>
+                <span>Токены: {formatNumber(job.total_tokens)} всего · {formatNumber(job.input_tokens)} входящих · {formatNumber(job.output_tokens)} исходящих{job.cost_usd ? ` · $${Number(job.cost_usd).toFixed(4)}` : ""}</span>
               </div>
+              {pausedJob && <button className="secondary-button" type="button" onClick={() => void resumeJob()} disabled={busy}><Icon name="refresh" size={16} />Продолжить</button>}
               {!completedJob && <div className="analysis-progress"><div className="progress-track"><span style={{ width: `${job.progress_percent}%` }} /></div><b>{job.progress_percent}%</b></div>}
             </section>
           )}
@@ -881,6 +1044,94 @@ export default function Home() {
                     </article>
                   ) : (
                     <div className="empty-search"><Icon name="search" size={22} /><span>Персонаж не выбран</span></div>
+                  )}
+                </section>
+              )}
+
+              {selectedBook && (
+                <section className="story-section">
+                  <div className="section-heading reader-heading">
+                    <div><div className="section-kicker">СОБЫТИЯ И ЛОКАЦИИ</div><h2>Хроника книги</h2></div>
+                    <div className="reader-book-meta">
+                      <span>{formatNumber(storyEventsTotal)} событий</span>
+                      <span className="status-pip status-affirmed" />
+                      <span>{formatNumber(locations.length)} локаций</span>
+                    </div>
+                  </div>
+                  <div className="character-subtabs" aria-label="Вкладки событий и локаций">
+                    <button type="button" className={storyTab === "events" ? "active" : ""} onClick={() => setStoryTab("events")}>События</button>
+                    <button type="button" className={storyTab === "locations" ? "active" : ""} onClick={() => setStoryTab("locations")}>Локации</button>
+                    {storyTab === "events" && (
+                      <select className="story-filter" value={eventImportance} onChange={(event) => setEventImportance(event.target.value)} aria-label="Фильтр событий">
+                        <option value="all">Все события</option>
+                        <option value="major">Только важные</option>
+                        <option value="turning">Поворотные и кульминации</option>
+                      </select>
+                    )}
+                    {storyEventsTotal > 0 && !jobActive && <button type="button" className="text-button" onClick={() => void startStoryExtraction(true)} disabled={busy}>Извлечь заново <Icon name="refresh" size={13} /></button>}
+                  </div>
+
+                  {!storyEventsTotal && !locations.length ? (
+                    <div className="empty-search story-empty">
+                      <Icon name="sparkles" size={22} />
+                      <span>{jobActive ? (storyJob ? "Идёт извлечение событий и локаций…" : "События появятся после анализа персонажей") : "Событий пока нет"}</span>
+                      {!jobActive && <button className="secondary-button" type="button" onClick={() => void startStoryExtraction()} disabled={busy}><Icon name="sparkles" size={16} />Извлечь события и локации</button>}
+                    </div>
+                  ) : storyTab === "events" ? (
+                    <ol className="event-list">
+                      {filteredEvents.map((item) => (
+                        <li className={`event-item ${item.importance === "major" ? "event-major" : ""}`} key={item.id}>
+                          <div className="event-chapter">ГЛ. {String(item.chapter_number ?? 0).padStart(2, "0")}</div>
+                          <div className="event-body">
+                            <div className="event-title-row">
+                              <strong>{item.title}</strong>
+                              <span className="event-badge">{EVENT_TYPE_LABELS[item.event_type] ?? item.event_type}</span>
+                              {item.importance === "major" && <span className="event-badge badge-major">Важное</span>}
+                              {item.is_turning_point && <span className="event-badge badge-turn">Поворот</span>}
+                              {item.is_climax && <span className="event-badge badge-turn">Кульминация</span>}
+                              {item.status === "confirmed" && <span className="event-badge badge-ok">Подтверждено</span>}
+                            </div>
+                            <p>{item.description}</p>
+                            <div className="event-meta">
+                              {(item.location || item.raw_location_name) && <span>📍 {item.location?.name ?? item.raw_location_name}</span>}
+                              {item.time_text && <span>🕒 {item.time_text}</span>}
+                              {item.participants.length > 0 && <span>👤 {item.participants.map((p) => `${p.name}${p.match_status !== "matched" ? " (?)" : ""}${p.role ? ` — ${p.role}` : ""}`).join(", ")}</span>}
+                            </div>
+                            {(item.cause || item.consequences) && <div className="event-meta">{item.cause && <span>Причина: {item.cause}</span>}{item.consequences && <span>Последствия: {item.consequences}</span>}</div>}
+                            <details className="evidence"><summary>Цитата из книги</summary><blockquote>{item.evidence}</blockquote></details>
+                          </div>
+                          <div className="event-actions">
+                            {item.status !== "confirmed" && <button type="button" className="text-button" onClick={() => void setEventStatus(item.id, "confirmed")}>Подтвердить</button>}
+                            <button type="button" className="text-button" onClick={() => void setEventStatus(item.id, "rejected")}>Отклонить</button>
+                          </div>
+                        </li>
+                      ))}
+                      {!filteredEvents.length && <div className="empty-search"><span>Нет событий по этому фильтру</span></div>}
+                    </ol>
+                  ) : (
+                    <div className="location-grid">
+                      {locations.map((item) => (
+                        <article className="location-card" key={item.id}>
+                          <div className="event-title-row">
+                            <strong>{item.canonical_name}</strong>
+                            <span className="event-badge">{LOCATION_TYPE_LABELS[item.location_type] ?? item.location_type}</span>
+                            {item.status === "confirmed" && <span className="event-badge badge-ok">Подтверждена</span>}
+                          </div>
+                          {item.aliases.length > 0 && <small className="location-aliases">Также: {item.aliases.join(", ")}</small>}
+                          {item.description && <p>{item.description}</p>}
+                          {item.attributes.length > 0 && (
+                            <ul className="location-attributes">
+                              {item.attributes.slice(0, 6).map((attr) => <li key={attr.id} title={attr.evidence}><b>{LOCATION_ATTR_LABELS[attr.category] ?? attr.category}:</b> {attr.value}</li>)}
+                            </ul>
+                          )}
+                          <div className="event-meta"><span>{formatNumber(item.events_count)} событий</span><span>{formatNumber(item.mentions_count)} упоминаний</span></div>
+                          <div className="event-actions">
+                            {item.status !== "confirmed" && <button type="button" className="text-button" onClick={() => void setLocationStatus(item.id, "confirmed")}>Подтвердить</button>}
+                            <button type="button" className="text-button" onClick={() => void setLocationStatus(item.id, "rejected")}>Отклонить</button>
+                          </div>
+                        </article>
+                      ))}
+                    </div>
                   )}
                 </section>
               )}
